@@ -16,7 +16,7 @@ export interface RateLimitRecord {
   firstRequestTime: number;
 }
 
-// In-process fallback store when Firestore credentials are not yet supplied during local development
+// In-process fallback store when Firestore credentials are not yet supplied
 const globalFallbackStore = global as unknown as {
   _otpStore?: Map<string, OtpRecord>;
   _rateLimitStore?: Map<string, RateLimitRecord>;
@@ -34,9 +34,6 @@ const memoryRateLimits = globalFallbackStore._rateLimitStore;
 const OTP_COLLECTION = "flowtake_otp_records";
 const RATE_LIMIT_COLLECTION = "flowtake_rate_limits";
 
-/**
- * Clean up expired records from fallback store
- */
 function cleanupMemoryStore() {
   const now = Date.now();
   for (const [key, record] of memoryStore.entries()) {
@@ -46,48 +43,12 @@ function cleanupMemoryStore() {
   }
 }
 
-/**
- * Atomically check and update rate limits.
- * Default: Max 5 requests per IP/Email within a 15-minute window.
- */
-export async function checkRateLimit(
+function memoryCheckRateLimit(
   identifier: string,
-  limit: number = 5,
-  windowMs: number = 15 * 60 * 1000
-): Promise<{ allowed: boolean; remaining: number; resetInMs: number }> {
-  const { db, isAvailable } = getFirebaseAdmin();
+  limit: number,
+  windowMs: number
+): { allowed: boolean; remaining: number; resetInMs: number } {
   const now = Date.now();
-
-  if (isAvailable && db) {
-    const docRef = db.collection(RATE_LIMIT_COLLECTION).doc(identifier.replace(/[^a-zA-Z0-9_-]/g, "_"));
-    return await db.runTransaction(async (t) => {
-      const snap = await t.get(docRef);
-      if (!snap.exists) {
-        t.set(docRef, { requests: 1, firstRequestTime: now, expiresAt: now + windowMs });
-        return { allowed: true, remaining: limit - 1, resetInMs: windowMs };
-      }
-      const data = snap.data() as RateLimitRecord & { expiresAt: number };
-      if (now - data.firstRequestTime > windowMs) {
-        // Reset window
-        t.set(docRef, { requests: 1, firstRequestTime: now, expiresAt: now + windowMs });
-        return { allowed: true, remaining: limit - 1, resetInMs: windowMs };
-      }
-
-      if (data.requests >= limit) {
-        const resetInMs = Math.max(0, data.firstRequestTime + windowMs - now);
-        return { allowed: false, remaining: 0, resetInMs };
-      }
-
-      t.update(docRef, { requests: data.requests + 1 });
-      return {
-        allowed: true,
-        remaining: limit - (data.requests + 1),
-        resetInMs: Math.max(0, data.firstRequestTime + windowMs - now),
-      };
-    });
-  }
-
-  // Fallback to in-process memory store
   const existing = memoryRateLimits.get(identifier);
   if (!existing || now - existing.firstRequestTime > windowMs) {
     memoryRateLimits.set(identifier, { requests: 1, firstRequestTime: now });
@@ -107,13 +68,53 @@ export async function checkRateLimit(
   };
 }
 
-/**
- * Save new OTP record. Overwrites/invalidates any previous OTP for this email.
- */
+export async function checkRateLimit(
+  identifier: string,
+  limit: number = 5,
+  windowMs: number = 15 * 60 * 1000
+): Promise<{ allowed: boolean; remaining: number; resetInMs: number }> {
+  try {
+    const { db, isAvailable } = getFirebaseAdmin();
+    const now = Date.now();
+
+    if (isAvailable && db) {
+      const docRef = db.collection(RATE_LIMIT_COLLECTION).doc(identifier.replace(/[^a-zA-Z0-9_-]/g, "_"));
+      return await db.runTransaction(async (t) => {
+        const snap = await t.get(docRef);
+        if (!snap.exists) {
+          t.set(docRef, { requests: 1, firstRequestTime: now, expiresAt: now + windowMs });
+          return { allowed: true, remaining: limit - 1, resetInMs: windowMs };
+        }
+        const data = snap.data() as RateLimitRecord & { expiresAt: number };
+        if (now - data.firstRequestTime > windowMs) {
+          t.set(docRef, { requests: 1, firstRequestTime: now, expiresAt: now + windowMs });
+          return { allowed: true, remaining: limit - 1, resetInMs: windowMs };
+        }
+
+        if (data.requests >= limit) {
+          const resetInMs = Math.max(0, data.firstRequestTime + windowMs - now);
+          return { allowed: false, remaining: 0, resetInMs };
+        }
+
+        t.update(docRef, { requests: data.requests + 1 });
+        return {
+          allowed: true,
+          remaining: limit - (data.requests + 1),
+          resetInMs: Math.max(0, data.firstRequestTime + windowMs - now),
+        };
+      });
+    }
+  } catch (err) {
+    console.warn("[RateLimit Store] Fallback to memory due to:", err);
+  }
+
+  return memoryCheckRateLimit(identifier, limit, windowMs);
+}
+
 export async function saveOtpRecord(
   email: string,
   otpHash: string,
-  ttlSeconds: number = 300 // 5 minutes
+  ttlSeconds: number = 300
 ): Promise<OtpRecord> {
   const normalizedEmail = email.trim().toLowerCase();
   const now = Date.now();
@@ -125,14 +126,18 @@ export async function saveOtpRecord(
     attempts: 0,
     maxAttempts: 5,
     used: false,
-    resendAfter: now + 60 * 1000, // 60 seconds cooldown before resend
+    resendAfter: now + 60 * 1000,
   };
 
-  const { db, isAvailable } = getFirebaseAdmin();
-  if (isAvailable && db) {
-    const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
-    await docRef.set(record);
-    return record;
+  try {
+    const { db, isAvailable } = getFirebaseAdmin();
+    if (isAvailable && db) {
+      const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
+      await docRef.set(record);
+      return record;
+    }
+  } catch (err) {
+    console.warn("[Otp Store] Falling back to memory store:", err);
   }
 
   cleanupMemoryStore();
@@ -140,40 +145,40 @@ export async function saveOtpRecord(
   return record;
 }
 
-/**
- * Get active OTP record for an email.
- */
 export async function getOtpRecord(email: string): Promise<OtpRecord | null> {
   const normalizedEmail = email.trim().toLowerCase();
-  const { db, isAvailable } = getFirebaseAdmin();
-
-  if (isAvailable && db) {
-    const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
-    const snap = await docRef.get();
-    if (!snap.exists) return null;
-    return snap.data() as OtpRecord;
+  try {
+    const { db, isAvailable } = getFirebaseAdmin();
+    if (isAvailable && db) {
+      const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
+      const snap = await docRef.get();
+      if (!snap.exists) return null;
+      return snap.data() as OtpRecord;
+    }
+  } catch (err) {
+    console.warn("[Otp Store] getOtpRecord fallback to memory:", err);
   }
 
   return memoryStore.get(normalizedEmail) || null;
 }
 
-/**
- * Increment verification attempts atomically.
- */
 export async function incrementOtpAttempts(email: string): Promise<{ attempts: number; maxAttempts: number }> {
   const normalizedEmail = email.trim().toLowerCase();
-  const { db, isAvailable } = getFirebaseAdmin();
-
-  if (isAvailable && db) {
-    const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
-    return await db.runTransaction(async (t) => {
-      const snap = await t.get(docRef);
-      if (!snap.exists) return { attempts: 0, maxAttempts: 5 };
-      const current = snap.data() as OtpRecord;
-      const nextAttempts = (current.attempts || 0) + 1;
-      t.update(docRef, { attempts: nextAttempts });
-      return { attempts: nextAttempts, maxAttempts: current.maxAttempts || 5 };
-    });
+  try {
+    const { db, isAvailable } = getFirebaseAdmin();
+    if (isAvailable && db) {
+      const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
+      return await db.runTransaction(async (t) => {
+        const snap = await t.get(docRef);
+        if (!snap.exists) return { attempts: 0, maxAttempts: 5 };
+        const current = snap.data() as OtpRecord;
+        const nextAttempts = (current.attempts || 0) + 1;
+        t.update(docRef, { attempts: nextAttempts });
+        return { attempts: nextAttempts, maxAttempts: current.maxAttempts || 5 };
+      });
+    }
+  } catch (err) {
+    console.warn("[Otp Store] incrementOtpAttempts fallback to memory:", err);
   }
 
   const record = memoryStore.get(normalizedEmail);
@@ -182,17 +187,17 @@ export async function incrementOtpAttempts(email: string): Promise<{ attempts: n
   return { attempts: record.attempts, maxAttempts: record.maxAttempts };
 }
 
-/**
- * Mark OTP as used atomically.
- */
 export async function markOtpAsUsed(email: string): Promise<void> {
   const normalizedEmail = email.trim().toLowerCase();
-  const { db, isAvailable } = getFirebaseAdmin();
-
-  if (isAvailable && db) {
-    const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
-    await docRef.update({ used: true, usedAt: Date.now() });
-    return;
+  try {
+    const { db, isAvailable } = getFirebaseAdmin();
+    if (isAvailable && db) {
+      const docRef = db.collection(OTP_COLLECTION).doc(normalizedEmail);
+      await docRef.update({ used: true, usedAt: Date.now() });
+      return;
+    }
+  } catch (err) {
+    console.warn("[Otp Store] markOtpAsUsed fallback to memory:", err);
   }
 
   const record = memoryStore.get(normalizedEmail);
