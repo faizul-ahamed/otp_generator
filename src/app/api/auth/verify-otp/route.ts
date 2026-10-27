@@ -1,3 +1,4 @@
+export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from "next/server";
 import { isValidEmail, verifyOTPHash } from "@/lib/crypto-otp";
 import { getOtpRecord, incrementOtpAttempts, markOtpAsUsed, checkRateLimit } from "@/lib/otp-store";

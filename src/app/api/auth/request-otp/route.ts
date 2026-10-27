@@ -1,3 +1,4 @@
+export const dynamic = 'force-dynamic';
 import { NextRequest, NextResponse } from "next/server";
 import { isValidEmail, generateSecureOTP, hashOTP } from "@/lib/crypto-otp";
 import { saveOtpRecord, checkRateLimit, getOtpRecord } from "@/lib/otp-store";
