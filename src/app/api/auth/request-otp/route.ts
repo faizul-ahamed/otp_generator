@@ -89,9 +89,10 @@ export async function POST(req: NextRequest) {
       devOtpHint: mailResult.devMode ? rawOtp : undefined,
     });
   } catch (error: unknown) {
-    console.error("[OTP Request Error]:", error);
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[OTP Request Error]:", message, error);
     return NextResponse.json(
-      { success: false, error: "An unexpected error occurred. Please try again later." },
+      { success: false, error: `Authentication service error: ${message}` },
       { status: 500 }
     );
   }
